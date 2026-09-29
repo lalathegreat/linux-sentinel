@@ -19,6 +19,8 @@ set(SENTINEL_SOURCES
     src/main.cpp
     src/HealthCollector.cpp
     src/AnomalyDetector.cpp
+    src/DependencyManager.cpp
+    src/DiagnosisEngine.cpp
     src/Logger.cpp
 )
 
@@ -29,6 +31,16 @@ add_executable(sentinel ${SENTINEL_SOURCES})
 # ----------------------------------------------------
 add_executable(fault_app test_service/fault_app.cpp)
 
+# ----------------------------------------------------
+# Target 3: Diagnostic Engine Unit Test
+# ----------------------------------------------------
+add_executable(test_diagnosis 
+    tests/test_diagnosis.cpp
+    src/DependencyManager.cpp
+    src/DiagnosisEngine.cpp
+)
+
 # Output binaries directly in project root or build/
 set_target_properties(sentinel PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(fault_app PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set_target_properties(test_diagnosis PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
