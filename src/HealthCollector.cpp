@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <cerrno>
 
 #if defined(__APPLE__)
 #include <libproc.h>
@@ -20,8 +22,20 @@ HealthCollector::HealthCollector() {
 
 bool HealthCollector::isProcessAlive(int pid) {
     if (pid <= 0) return false;
-    // kill(pid, 0) checks if the process exists without delivering a signal
-    return (kill(pid, 0) == 0);
+
+    // First check if this is our child that has terminated/zombied
+    int status = 0;
+    pid_t w = waitpid(pid, &status, WNOHANG);
+    if (w == pid || (w == -1 && errno == ECHILD)) {
+        return false; // Process has exited
+    }
+
+    // Next check via POSIX kill signal 0
+    if (kill(pid, 0) != 0) {
+        return false;
+    }
+
+    return true;
 }
 
 void HealthCollector::clearProcessCache(int pid) {
@@ -36,15 +50,12 @@ bool HealthCollector::parseProcStat(int pid, ProcessMetrics& metrics) {
     std::string line;
     if (!std::getline(file, line)) return false;
 
-    // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime ...
-    // Extract comm enclosed in parentheses
     auto open_paren = line.find('(');
     auto close_paren = line.rfind(')');
     if (open_paren == std::string::npos || close_paren == std::string::npos || close_paren < open_paren) {
         return false;
     }
 
-    // Process state is immediately following ") "
     std::string rest = line.substr(close_paren + 2);
     std::istringstream iss(rest);
 
@@ -103,7 +114,6 @@ bool HealthCollector::parsePosixFallback(int pid, ProcessMetrics& metrics) {
     metrics.num_threads = tinfo.pti_threadnum;
     metrics.state_char = 'R';
 
-    // Convert nanoseconds to clock ticks for consistent CPU calculation
     uint64_t total_ticks = (tinfo.pti_total_user + tinfo.pti_total_system) / (1000000000ULL / clock_ticks_per_sec_);
     metrics.utime_ticks = total_ticks;
     metrics.stime_ticks = 0;
@@ -131,29 +141,35 @@ ProcessMetrics HealthCollector::pollProcess(int pid, const std::string& service_
     // 1. Attempt Linux /proc ingestion
     bool success = parseProcStat(pid, metrics) && parseProcStatus(pid, metrics);
 
-    // 2. If /proc is not available (e.g. running natively on macOS development host), use fallback
+    // 2. If /proc is not available (macOS development host), use fallback
     if (!success) {
         success = parsePosixFallback(pid, metrics);
     }
 
-    // 3. Compute differential CPU percentage
-    if (success) {
-        auto it = previous_samples_.find(pid);
-        if (it != previous_samples_.end()) {
-            const CpuSample& prev = it->second;
-            uint64_t delta_ticks = (metrics.utime_ticks + metrics.stime_ticks) - 
-                                  (prev.utime_ticks + prev.stime_ticks);
-            double delta_sec = (metrics.timestamp_ms - prev.timestamp_ms) / 1000.0;
-
-            if (delta_sec > 0.05 && clock_ticks_per_sec_ > 0) {
-                double percent = ((static_cast<double>(delta_ticks) / clock_ticks_per_sec_) / delta_sec) * 100.0;
-                metrics.cpu_percent = (percent < 0.0) ? 0.0 : percent;
-            }
-        }
-
-        // Cache current sample
-        previous_samples_[pid] = {metrics.utime_ticks, metrics.stime_ticks, metrics.timestamp_ms};
+    // If telemetry reading failed, process has likely exited or zombied
+    if (!success) {
+        metrics.is_alive = false;
+        metrics.state_char = 'Z';
+        previous_samples_.erase(pid);
+        return metrics;
     }
+
+    // 3. Compute differential CPU percentage
+    auto it = previous_samples_.find(pid);
+    if (it != previous_samples_.end()) {
+        const CpuSample& prev = it->second;
+        uint64_t delta_ticks = (metrics.utime_ticks + metrics.stime_ticks) - 
+                              (prev.utime_ticks + prev.stime_ticks);
+        double delta_sec = (metrics.timestamp_ms - prev.timestamp_ms) / 1000.0;
+
+        if (delta_sec > 0.05 && clock_ticks_per_sec_ > 0) {
+            double percent = ((static_cast<double>(delta_ticks) / clock_ticks_per_sec_) / delta_sec) * 100.0;
+            metrics.cpu_percent = (percent < 0.0) ? 0.0 : percent;
+        }
+    }
+
+    // Cache current sample
+    previous_samples_[pid] = {metrics.utime_ticks, metrics.stime_ticks, metrics.timestamp_ms};
 
     return metrics;
 }

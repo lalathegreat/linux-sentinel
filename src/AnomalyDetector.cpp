@@ -52,12 +52,12 @@ std::optional<AnomalyReport> AnomalyDetector::evaluate(const ProcessMetrics& met
     report.service_name = metrics.service_name;
     report.timestamp_ms = metrics.timestamp_ms;
 
-    // 1. Immediate Critical Check: Process Termination
-    if (!metrics.is_alive) {
+    // 1. Immediate Critical Check: Process Termination or Zombie State
+    if (!metrics.is_alive || metrics.state_char == 'Z' || metrics.state_char == '?') {
         report.fault_type = FaultType::PROCESS_TERMINATED;
         report.severity = Severity::SEV_CRITICAL;
         report.consecutive_samples = 1;
-        report.message = "Process has terminated unexpectedly or PID no longer exists.";
+        report.message = "Process has terminated unexpectedly or entered Zombie state.";
         resetHistory(metrics.service_name);
         return report;
     }
