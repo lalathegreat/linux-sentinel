@@ -26,6 +26,7 @@ public:
     
     void logIncident(const IncidentCard& card);
     std::string generateIncidentId();
+    bool isFileOpen() const;
 
 private:
     Logger() = default;

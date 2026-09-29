@@ -25,6 +25,7 @@ set(SENTINEL_SOURCES
     src/VerificationEngine.cpp
     src/RecoveryManager.cpp
     src/Logger.cpp
+    src/ConfigManager.cpp
 )
 
 add_executable(sentinel ${SENTINEL_SOURCES})
@@ -55,8 +56,17 @@ add_executable(test_recovery
     src/Logger.cpp
 )
 
+# ----------------------------------------------------
+# Target 5: Configuration Manager Unit Test
+# ----------------------------------------------------
+add_executable(test_config
+    tests/test_config.cpp
+    src/ConfigManager.cpp
+)
+
 # Output binaries directly in project root or build/
 set_target_properties(sentinel PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(fault_app PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(test_diagnosis PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(test_recovery PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set_target_properties(test_config PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

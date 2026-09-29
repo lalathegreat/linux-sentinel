@@ -6,6 +6,7 @@
 #include "CheckpointManager.h"
 #include "VerificationEngine.h"
 #include "RecoveryManager.h"
+#include "ConfigManager.h"
 #include "Logger.h"
 
 #include <iostream>
@@ -36,11 +37,13 @@ void printHelp() {
               << "Options:\n"
               << "  -v, --version                Print version information and exit\n"
               << "  -h, --help                   Display this help message and exit\n"
+              << "  -c, --config <FILE>          Load service definitions from configuration file\n"
               << "  -m, --monitor <PID> <NAME>   Monitor an existing running process by PID\n"
               << "  -s, --spawn <CMD> [ARGS...]  Spawn and supervise a target application\n"
-              << "  -c, --config <FILE>          Load service definitions from configuration file\n"
+              << "  -d, --duration <SEC>         Run monitoring loop for N seconds, then exit\n"
               << "\nExamples:\n"
               << "  ./sentinel --version\n"
+              << "  ./sentinel --config config/sentinel.conf\n"
               << "  ./sentinel --spawn ./build/fault_app --normal\n"
               << "  ./sentinel --spawn ./build/fault_app --leak\n"
               << "  ./sentinel --monitor 1234 fault_app\n";
@@ -65,47 +68,159 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Initialize Logger
-    auto& logger = sentinel::Logger::getInstance();
-    logger.init("logs/incidents.log", true);
-    logger.info("Linux Sentinel daemon starting up. Initializing subsystems...");
-
-    // Initialize Core Subsystems
-    auto collector = std::make_shared<sentinel::HealthCollector>();
-    auto detector = std::make_shared<sentinel::AnomalyDetector>();
-    auto dep_mgr = std::make_shared<sentinel::DependencyManager>();
-    auto cp_mgr = std::make_shared<sentinel::CheckpointManager>("logs/snapshots");
-    auto verifier = std::make_shared<sentinel::VerificationEngine>(collector);
-    auto recovery_mgr = std::make_shared<sentinel::RecoveryManager>(collector, cp_mgr, verifier, 3000, 3, 60000);
-
-    // Register Default DAG Relationships
-    dep_mgr->registerService("fault_app", {});
-    dep_mgr->registerService("database", {});
-    dep_mgr->registerService("api_gateway", {"database"});
-    logger.info("Dependency graph initialized. Registered DAG (api_gateway -> database).");
-
-    sentinel::DiagnosisEngine diagnosis_engine(dep_mgr, 5000); // 5s cooldown
-
+    std::string config_path;
+    std::string mode;
     pid_t target_pid = -1;
     std::string service_name = "fault_app";
     std::string exec_path = "./build/fault_app";
     std::vector<std::string> child_args_str;
+    int max_duration_sec = -1;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-c" || arg == "--config") {
+            if (i + 1 < argc) {
+                config_path = argv[++i];
+            } else {
+                std::cerr << "[Sentinel Error] Option --config requires a file argument." << std::endl;
+                return 1;
+            }
+        } else if (arg == "-m" || arg == "--monitor") {
+            mode = "monitor";
+            if (i + 2 < argc) {
+                try {
+                    target_pid = std::stoi(argv[++i]);
+                } catch (...) {
+                    std::cerr << "[Sentinel Error] Invalid PID provided for --monitor: " << argv[i] << std::endl;
+                    return 1;
+                }
+                service_name = argv[++i];
+            } else {
+                std::cerr << "[Sentinel Error] Option --monitor requires <PID> and <NAME>." << std::endl;
+                return 1;
+            }
+        } else if (arg == "-s" || arg == "--spawn") {
+            mode = "spawn";
+            if (i + 1 < argc) {
+                exec_path = argv[++i];
+                while (i + 1 < argc) {
+                    std::string next_arg = argv[i + 1];
+                    if (next_arg == "-d" || next_arg == "--duration" || 
+                        next_arg == "-c" || next_arg == "--config") {
+                        break;
+                    }
+                    child_args_str.push_back(argv[++i]);
+                }
+            } else {
+                std::cerr << "[Sentinel Error] Option --spawn requires executable path." << std::endl;
+                return 1;
+            }
+        } else if (arg == "-d" || arg == "--duration") {
+            if (i + 1 < argc) {
+                max_duration_sec = std::stoi(argv[++i]);
+            }
+        }
+    }
+
+    sentinel::ConfigManager config_mgr;
+    if (!config_path.empty()) {
+        if (!config_mgr.loadFromFile(config_path)) {
+            std::cerr << "[Sentinel Error] Malformed configuration file '" << config_path 
+                      << "': " << config_mgr.getLastError() << std::endl;
+            return 1;
+        }
+        std::cout << "[Sentinel Info] Loaded and validated configuration from '" << config_path << "' successfully." << std::endl;
+        
+        // If no explicit spawn/monitor mode provided, check config services
+        if (mode.empty()) {
+            const auto& services = config_mgr.getServices();
+            if (!services.empty()) {
+                auto it = services.find("fault_app");
+                const auto& first_svc = (it != services.end()) ? it->second : services.begin()->second;
+                mode = "spawn";
+                service_name = first_svc.name;
+                exec_path = first_svc.executable;
+                child_args_str = first_svc.arguments;
+            }
+        }
+    }
+
+    if (mode.empty()) {
+        if (!config_path.empty()) {
+            // Configuration validated cleanly, exit 0 if only config check
+            return 0;
+        }
+        printHelp();
+        return 1;
+    }
+
+    // Initialize Logger
+    auto& logger = sentinel::Logger::getInstance();
+    std::string log_file = config_path.empty() ? "logs/incidents.log" : config_mgr.getGlobalConfig().log_file_path;
+    bool enable_color = config_path.empty() ? true : config_mgr.getGlobalConfig().enable_ansi_tui;
+    logger.init(log_file, enable_color);
+    logger.info("Linux Sentinel daemon starting up. Initializing subsystems...");
+
+    // Initialize Core Subsystems
+    auto collector = std::make_shared<sentinel::HealthCollector>();
+    
+    // Anomaly detector thresholds
+    sentinel::DetectionThresholds thresholds;
+    if (!config_path.empty()) {
+        const auto& dcfg = config_mgr.getDetectionConfig();
+        thresholds.consecutive_breaches_required = static_cast<int>(dcfg.consecutive_samples_required);
+        thresholds.memory_leak_slope_kb = static_cast<long>(dcfg.memory_leak_slope_threshold_kb);
+        thresholds.max_rss_limit_kb = static_cast<long>(dcfg.memory_max_rss_limit_kb);
+        thresholds.cpu_saturation_percent = dcfg.cpu_saturation_threshold_percent;
+        thresholds.window_size = dcfg.history_window_size;
+    }
+    auto detector = std::make_shared<sentinel::AnomalyDetector>(thresholds);
+
+    auto dep_mgr = std::make_shared<sentinel::DependencyManager>();
+    auto cp_mgr = std::make_shared<sentinel::CheckpointManager>("logs/snapshots");
+    auto verifier = std::make_shared<sentinel::VerificationEngine>(collector);
+
+    // Recovery manager parameters
+    uint32_t stop_timeout = config_path.empty() ? 3000 : config_mgr.getRecoveryConfig().graceful_stop_timeout_ms;
+    uint32_t max_retries = config_path.empty() ? 3 : config_mgr.getRecoveryConfig().circuit_breaker_max_retries;
+    uint32_t breaker_window = config_path.empty() ? 60000 : config_mgr.getRecoveryConfig().circuit_breaker_window_ms;
+    auto recovery_mgr = std::make_shared<sentinel::RecoveryManager>(collector, cp_mgr, verifier, stop_timeout, max_retries, breaker_window);
+
+    // Register Default DAG Relationships or config services
+    if (!config_path.empty()) {
+        for (const auto& [name, svc] : config_mgr.getServices()) {
+            dep_mgr->registerService(name, svc.depends_on);
+            recovery_mgr->registerService(name, svc.executable, svc.arguments, svc.allow_auto_recovery);
+        }
+    } else {
+        dep_mgr->registerService("fault_app", {});
+        dep_mgr->registerService("database", {});
+        dep_mgr->registerService("api_gateway", {"database"});
+    }
+    logger.info("Dependency graph initialized. Registered DAG services.");
+
+    uint32_t diag_cooldown = config_path.empty() ? 5000 : config_mgr.getRecoveryConfig().diagnosis_cooldown_ms;
+    sentinel::DiagnosisEngine diagnosis_engine(dep_mgr, diag_cooldown);
+
     bool spawned_by_us = false;
 
-    if ((first_arg == "-m" || first_arg == "--monitor") && argc >= 4) {
-        target_pid = std::stoi(argv[2]);
-        service_name = argv[3];
+    if (mode == "monitor") {
+        // T2 requirement: verify target is actually running at startup
+        if (!collector->isProcessAlive(target_pid)) {
+            std::cerr << "[Sentinel Error] Target process PID " << target_pid 
+                      << " is not running at startup. No unrelated process touched." << std::endl;
+            return 1;
+        }
+
         dep_mgr->registerService(service_name, {});
         recovery_mgr->registerService(service_name, exec_path, child_args_str, true);
         recovery_mgr->updateActivePid(service_name, target_pid);
         logger.info("Attaching to existing process PID " + std::to_string(target_pid) + " (" + service_name + ")");
-    } else if ((first_arg == "-s" || first_arg == "--spawn") && argc >= 3) {
-        exec_path = argv[2];
-        for (int i = 3; i < argc; ++i) {
-            child_args_str.push_back(argv[i]);
+    } else if (mode == "spawn") {
+        if (service_name.empty()) {
+            service_name = exec_path.substr(exec_path.find_last_of("/\\") + 1);
         }
-
-        service_name = exec_path.substr(exec_path.find_last_of("/\\") + 1);
         dep_mgr->registerService(service_name, {});
         recovery_mgr->registerService(service_name, exec_path, child_args_str, true);
 
@@ -130,17 +245,26 @@ int main(int argc, char* argv[]) {
             logger.error("Failed to fork child process!");
             return 1;
         }
-    } else {
-        printHelp();
-        return 1;
     }
 
-    logger.info("Starting closed-loop self-healing engine (Interval: 1000ms)...");
+    uint32_t polling_interval_ms = config_path.empty() ? 1000 : config_mgr.getGlobalConfig().polling_interval_ms;
+    logger.info("Starting closed-loop self-healing engine (Interval: " + std::to_string(polling_interval_ms) + "ms)...");
 
     // Allow child process 200ms to spin up
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+    auto start_time = std::chrono::steady_clock::now();
+
     while (g_keep_running) {
+        if (max_duration_sec > 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            if (elapsed >= max_duration_sec) {
+                logger.info("Reached maximum duration (" + std::to_string(max_duration_sec) + "s). Exiting loop.");
+                break;
+            }
+        }
+
         sentinel::ProcessMetrics metrics = collector->pollProcess(target_pid, service_name);
         
         // Log telemetry
@@ -185,10 +309,12 @@ int main(int argc, char* argv[]) {
                 } else if (!diag.blocked_by_dependency.empty()) {
                     logger.warn("Recovery withheld: Upstream dependency is down (" + diag.blocked_by_dependency + ")");
                 }
+            } else {
+                logger.warn("DIAGNOSIS COOLDOWN ACTIVE for " + service_name + ": suppressing repeated recovery action.");
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(polling_interval_ms));
     }
 
     logger.info("Linux Sentinel shut down cleanly.");

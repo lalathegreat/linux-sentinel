@@ -23,19 +23,19 @@ HealthCollector::HealthCollector() {
 bool HealthCollector::isProcessAlive(int pid) {
     if (pid <= 0) return false;
 
-    // First check if this is our child that has terminated/zombied
+    // Check if this is our direct child that has terminated/zombied
     int status = 0;
     pid_t w = waitpid(pid, &status, WNOHANG);
-    if (w == pid || (w == -1 && errno == ECHILD)) {
-        return false; // Process has exited
+    if (w == pid) {
+        return false; // Direct child has exited/terminated
     }
 
     // Next check via POSIX kill signal 0
-    if (kill(pid, 0) != 0) {
-        return false;
+    if (kill(pid, 0) == 0) {
+        return true;
     }
 
-    return true;
+    return false;
 }
 
 void HealthCollector::clearProcessCache(int pid) {

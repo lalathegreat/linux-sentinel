@@ -19,13 +19,24 @@ void Logger::init(const std::string& log_file_path, bool enable_color) {
     log_file_path_ = log_file_path;
     enable_color_ = enable_color;
 
-    // Ensure parent directory exists
-    std::filesystem::path p(log_file_path_);
-    if (p.has_parent_path()) {
-        std::filesystem::create_directories(p.parent_path());
+    try {
+        std::filesystem::path p(log_file_path_);
+        if (p.has_parent_path()) {
+            std::filesystem::create_directories(p.parent_path());
+        }
+        file_stream_.open(log_file_path_, std::ios::out | std::ios::app);
+        if (!file_stream_.is_open()) {
+            std::cerr << "[Logger Error] Failed to open log file '" << log_file_path_ 
+                      << "' for writing (Permission denied or invalid path). Events will not be persisted to disk." << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Logger Error] Filesystem exception opening log file '" << log_file_path_ 
+                  << "': " << e.what() << ". Events will not be persisted to disk." << std::endl;
     }
+}
 
-    file_stream_.open(log_file_path_, std::ios::out | std::ios::app);
+bool Logger::isFileOpen() const {
+    return file_stream_.is_open();
 }
 
 Logger::~Logger() {
