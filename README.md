@@ -24,6 +24,7 @@ Developed as a capstone project for **Wipro Embedded/Linux Systems Engineering**
 | **Stage 4** | **Prototype Implementation** | [src/](src/) & [include/](include/) |
 | **Stage 5** | **Test Report & Verification Evidence** | [docs/Stage5_TestReport.md](docs/Stage5_TestReport.md) |
 | **Stage 6** | **Submission Bundle & Compliance Audit** | [docs/Stage6_SubmissionBundle.md](docs/Stage6_SubmissionBundle.md) |
+| **Stage 6** | **10-Minute Presentation & Technical Defense** | [docs/Stage6_FinalPresentation.md](docs/Stage6_FinalPresentation.md) |
 
 ---
 
