@@ -21,6 +21,9 @@ set(SENTINEL_SOURCES
     src/AnomalyDetector.cpp
     src/DependencyManager.cpp
     src/DiagnosisEngine.cpp
+    src/CheckpointManager.cpp
+    src/VerificationEngine.cpp
+    src/RecoveryManager.cpp
     src/Logger.cpp
 )
 
@@ -40,7 +43,20 @@ add_executable(test_diagnosis
     src/DiagnosisEngine.cpp
 )
 
+# ----------------------------------------------------
+# Target 4: Safe Recovery & Circuit Breaker Unit Test
+# ----------------------------------------------------
+add_executable(test_recovery
+    tests/test_recovery.cpp
+    src/HealthCollector.cpp
+    src/CheckpointManager.cpp
+    src/VerificationEngine.cpp
+    src/RecoveryManager.cpp
+    src/Logger.cpp
+)
+
 # Output binaries directly in project root or build/
 set_target_properties(sentinel PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(fault_app PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set_target_properties(test_diagnosis PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set_target_properties(test_recovery PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

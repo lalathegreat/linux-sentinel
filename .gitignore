@@ -11,10 +11,15 @@ lib/
 # Executables
 sentinel
 fault_app
+test_diagnosis
+test_recovery
 
-# Logs & Runtime State
+# Logs, Snapshots & Runtime State
 logs/*.log
+logs/*.snapshot
+logs/snapshots/*.snapshot
 !logs/.gitkeep
+!logs/snapshots/.gitkeep
 
 # IDE & OS Artifacts
 .DS_Store

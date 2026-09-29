@@ -3,6 +3,9 @@
 #include "AnomalyDetector.h"
 #include "DependencyManager.h"
 #include "DiagnosisEngine.h"
+#include "CheckpointManager.h"
+#include "VerificationEngine.h"
+#include "RecoveryManager.h"
 #include "Logger.h"
 
 #include <iostream>
@@ -38,8 +41,8 @@ void printHelp() {
               << "  -c, --config <FILE>          Load service definitions from configuration file\n"
               << "\nExamples:\n"
               << "  ./sentinel --version\n"
-              << "  ./sentinel --spawn ./fault_app --normal\n"
-              << "  ./sentinel --spawn ./fault_app --leak\n"
+              << "  ./sentinel --spawn ./build/fault_app --normal\n"
+              << "  ./sentinel --spawn ./build/fault_app --leak\n"
               << "  ./sentinel --monitor 1234 fault_app\n";
 }
 
@@ -67,12 +70,15 @@ int main(int argc, char* argv[]) {
     logger.init("logs/incidents.log", true);
     logger.info("Linux Sentinel daemon starting up. Initializing subsystems...");
 
-    // Initialize Core Engines
-    sentinel::HealthCollector collector;
-    sentinel::AnomalyDetector detector;
+    // Initialize Core Subsystems
+    auto collector = std::make_shared<sentinel::HealthCollector>();
+    auto detector = std::make_shared<sentinel::AnomalyDetector>();
     auto dep_mgr = std::make_shared<sentinel::DependencyManager>();
-    
-    // Configure default DAG relationships
+    auto cp_mgr = std::make_shared<sentinel::CheckpointManager>("logs/snapshots");
+    auto verifier = std::make_shared<sentinel::VerificationEngine>(collector);
+    auto recovery_mgr = std::make_shared<sentinel::RecoveryManager>(collector, cp_mgr, verifier, 3000, 3, 60000);
+
+    // Register Default DAG Relationships
     dep_mgr->registerService("fault_app", {});
     dep_mgr->registerService("database", {});
     dep_mgr->registerService("api_gateway", {"database"});
@@ -82,33 +88,43 @@ int main(int argc, char* argv[]) {
 
     pid_t target_pid = -1;
     std::string service_name = "fault_app";
+    std::string exec_path = "./build/fault_app";
+    std::vector<std::string> child_args_str;
     bool spawned_by_us = false;
 
     if ((first_arg == "-m" || first_arg == "--monitor") && argc >= 4) {
         target_pid = std::stoi(argv[2]);
         service_name = argv[3];
         dep_mgr->registerService(service_name, {});
+        recovery_mgr->registerService(service_name, exec_path, child_args_str, true);
+        recovery_mgr->updateActivePid(service_name, target_pid);
         logger.info("Attaching to existing process PID " + std::to_string(target_pid) + " (" + service_name + ")");
     } else if ((first_arg == "-s" || first_arg == "--spawn") && argc >= 3) {
-        std::string exec_path = argv[2];
-        std::vector<char*> child_args;
-        for (int i = 2; i < argc; ++i) {
-            child_args.push_back(argv[i]);
+        exec_path = argv[2];
+        for (int i = 3; i < argc; ++i) {
+            child_args_str.push_back(argv[i]);
         }
-        child_args.push_back(nullptr);
 
         service_name = exec_path.substr(exec_path.find_last_of("/\\") + 1);
         dep_mgr->registerService(service_name, {});
+        recovery_mgr->registerService(service_name, exec_path, child_args_str, true);
 
+        // Initial launch
         logger.info("Spawning child target: " + exec_path);
         target_pid = fork();
         if (target_pid == 0) {
-            // Child process
-            execvp(child_args[0], child_args.data());
-            std::cerr << "[Sentinel Error] Failed to exec " << child_args[0] << std::endl;
+            std::vector<char*> c_args;
+            c_args.push_back(const_cast<char*>(exec_path.c_str()));
+            for (const auto& a : child_args_str) {
+                c_args.push_back(const_cast<char*>(a.c_str()));
+            }
+            c_args.push_back(nullptr);
+            execvp(c_args[0], c_args.data());
+            std::cerr << "[Sentinel Error] Failed to exec " << c_args[0] << std::endl;
             _exit(1);
         } else if (target_pid > 0) {
             spawned_by_us = true;
+            recovery_mgr->updateActivePid(service_name, target_pid);
             logger.success("Spawned " + service_name + " with PID " + std::to_string(target_pid));
         } else {
             logger.error("Failed to fork child process!");
@@ -119,13 +135,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    logger.info("Starting closed-loop observability pipeline (Interval: 1000ms)...");
+    logger.info("Starting closed-loop self-healing engine (Interval: 1000ms)...");
 
     // Allow child process 200ms to spin up
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     while (g_keep_running) {
-        sentinel::ProcessMetrics metrics = collector.pollProcess(target_pid, service_name);
+        sentinel::ProcessMetrics metrics = collector->pollProcess(target_pid, service_name);
         
         // Log telemetry
         logger.info(metrics.to_string());
@@ -138,7 +154,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Evaluate Telemetry for Anomalies
-        auto anomaly_opt = detector.evaluate(metrics);
+        auto anomaly_opt = detector->evaluate(metrics);
         if (anomaly_opt.has_value()) {
             const auto& anomaly = *anomaly_opt;
             
@@ -149,37 +165,25 @@ int main(int argc, char* argv[]) {
                 sentinel::DiagnosisRecord diag = diagnosis_engine.diagnose(anomaly);
                 logger.warn("ANOMALY: " + anomaly.message);
                 logger.warn("DIAGNOSIS: " + diag.root_cause_evidence);
-                logger.info("RECOMMENDED ACTION: " + sentinel::recoveryActionToString(diag.recommended_action));
 
-                // Create Forensic Incident Snapshot
-                sentinel::IncidentSnapshot snapshot;
-                snapshot.incident_id = logger.generateIncidentId();
-                snapshot.timestamp_ms = sentinel::getCurrentTimeMs();
-                snapshot.service_name = service_name;
-                snapshot.target_pid = target_pid;
-                snapshot.metrics = metrics;
-                snapshot.trigger_reason = diag.root_cause_evidence;
+                // Check if Recovery Action is recommended
+                if (diag.recommended_action != sentinel::RecoveryActionType::ACTION_NONE) {
+                    logger.info("INITIATING SELF-HEALING RECOVERY SEQUENCE...");
 
-                // Generate and record Incident Card
-                sentinel::IncidentCard card;
-                card.incident_id = snapshot.incident_id;
-                card.service_name = service_name;
-                card.start_time_ms = snapshot.timestamp_ms;
-                card.end_time_ms = sentinel::getCurrentTimeMs();
-                card.initial_fault = diag.diagnosed_fault;
-                card.snapshot = snapshot;
-                card.action_taken = diag.recommended_action;
-                card.retry_count = 1;
-                card.status = sentinel::RecoveryStatus::STATUS_SUCCESS;
-                card.verification.is_successful = true;
-                card.verification.new_pid = target_pid;
-                card.verification.verification_notes = diag.root_cause_evidence;
-
-                logger.logIncident(card);
-
-                if (anomaly.fault_type == sentinel::FaultType::PROCESS_TERMINATED) {
-                    logger.error("Target process has exited. Stopping prototype observation loop.");
-                    break;
+                    sentinel::RecoveryResult rec_res = recovery_mgr->executeRecovery(diag, metrics);
+                    if (rec_res.success) {
+                        logger.success("SELF-HEALING COMPLETE: Service " + service_name + 
+                                       " recovered with new PID " + std::to_string(rec_res.new_pid));
+                        target_pid = rec_res.new_pid;
+                        detector->resetHistory(service_name);
+                    } else if (rec_res.status == sentinel::RecoveryStatus::STATUS_CIRCUIT_BREAKER_TRIPPED) {
+                        logger.error("CRITICAL: Circuit breaker tripped! Halting auto-recovery for " + service_name);
+                        break;
+                    } else {
+                        logger.error("Self-healing recovery failed: " + rec_res.summary);
+                    }
+                } else if (!diag.blocked_by_dependency.empty()) {
+                    logger.warn("Recovery withheld: Upstream dependency is down (" + diag.blocked_by_dependency + ")");
                 }
             }
         }
@@ -187,10 +191,10 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
-    logger.info("Linux Sentinel prototype shutting down cleanly.");
+    logger.info("Linux Sentinel shut down cleanly.");
 
     // Cleanup spawned child if active
-    if (spawned_by_us && target_pid > 0 && collector.isProcessAlive(target_pid)) {
+    if (spawned_by_us && target_pid > 0 && collector->isProcessAlive(target_pid)) {
         logger.info("Stopping supervised child PID " + std::to_string(target_pid) + " via SIGTERM...");
         kill(target_pid, SIGTERM);
         int status = 0;
