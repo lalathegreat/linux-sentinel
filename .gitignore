@@ -1,0 +1,25 @@
+# Build Artifacts
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+*.out
+
+# Executables
+sentinel
+fault_app
+
+# Logs & Runtime State
+logs/*.log
+!logs/.gitkeep
+
+# IDE & OS Artifacts
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+compile_commands.json
